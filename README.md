@@ -1,2 +1,2 @@
 # ROE-value-analysis
-ROE价值型选股策略
+基于聚宽平台编写ROE价值型选股策略
