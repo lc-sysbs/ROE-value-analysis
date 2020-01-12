@@ -1,0 +1,173 @@
+# 导入函数库
+import jqdata
+import pandas as pd
+from datetime import datetime
+
+# 定义ROE计算函数
+def roe_ttm(stocklist,scandate,num = 10,period = 'Q',cut = True,tb = True):
+    if isinstance(scandate,datetime):
+        scandate = datetime.strftime(scandate,'%Y-%m-%d')
+    # 定义相关参数
+    q = query(
+        income.statDate,#财报统计的季度的最后一天
+        income.pubDate,#公司发布财报日期
+        income.code,  #股票代码
+        income.np_parent_company_owners,#归属于母公司股东的净利润(元)
+        indicator.adjusted_profit,#扣除非经常损益后的净利润(元)
+        balance.equities_parent_company_owners,#归属于母公司股东权益合计(元)
+    ).filter(
+        income.code.in_(stocklist)#query是pandas里面的函数
+    )
+    # 季末时间表
+    if period.upper() == 'Q':
+        datelist = [str(dt) for dt in pd.date_range(start = '2000-01-01', end = scandate,freq = 'Q').to_period('Q')]
+    # 年末时间表
+    elif period.upper() == 'A':
+        datelist = [str(dt) for dt in pd.date_range(start = '2000-01-01', end = scandate,freq ='A').to_period('A')]
+    # 提取近期数据    
+    if num + 5 < len(datelist) and period.upper() == 'Q':
+        datelist = datelist[-num-5:]
+    elif num + 1 < len(datelist) and period.upper == 'A':
+        datelist = datelist[-num-1:]
+    # 构建数据字典
+    df = pd.DataFrame()
+    for dt in datelist:
+        df = pd.concat([df,get_fundamentals(q,statDate = dt)],axis = 0)
+    df.columns = ['statDate','pubDate','code','net_profit','adjust_profit','equities']
+    df.set_index(['statDate','code'],inplace = True)
+    df = df.unstack('code')
+    # 季末ROE滚动计算
+    if period.upper() == 'Q':
+        net_profit_ttm_df = pd.rolling_sum(df['net_profit'],4)
+        adjusted_profit_ttm_df = pd.rolling_sum(df['adjust_profit'],4)
+        equities_avg_df = pd.rolling_apply(df['equities'],4,lambda x: x[0]/2 + x[-1]/2)
+    # 四种
+        if cut and tb:
+            roe_df = adjusted_profit_ttm_df/df['equities']
+        elif cut and (not tb):
+            roe_df = adjusted_profit_ttm_df/equities_avg_df
+        elif (not cut) and tb:
+            roe_df = net_profit_ttm_df/df['equities']
+        else:
+            roe_df = net_profit_ttm_df/equities_avg_df      
+    # 年末ROE滚动计算
+    elif period.upper() == 'A':
+        equities_avg_df = pd.rolling_apply(df['equities'],2,lambda x:x[0]/2+x[-1]/2)
+        if cut and tb:
+            roe_df = df['adjust_profit']/df['equities']
+        elif cut and (not tb):
+            roe_df = df['adjust_profit']/equities_avg_df
+        elif (not cut) and tb:
+            roe_df = df['net_profit']/df['equities']
+        else:
+            roe_df = df['net_profit']/equities_avg_df
+    
+    roe_df = roe_df.stack()
+    df = df.stack()['pubDate']
+    df = pd.concat([df,roe_df],axis = 1)
+    
+    if cut and tb:
+        field = 'roe_cut_tb'
+    elif cut and (not tb):
+        field = 'roe_cut'
+    elif (not cut) and tb:
+        field = 'roe_tb'
+    else:
+        field = 'roe'
+    df.columns = ['pubDate',field]
+    df.reset_index(inplace = True)
+    # 规范日期格式
+    df['statDate'] = df['statDate'].map(lambda x:datetime.strptime(x,'%Y-%m-%d'))
+    df['pubDate']  = df['pubDate'].map(lambda x:datetime.strptime(x,'%Y-%m-%d'))
+    
+    return df.dropna()
+
+def roe_filter(roe_df):
+    df = pd.DataFrame()
+    field = roe_df.columns[-1]
+    df['new']  = roe_df.groupby('code')[field].apply(lambda x: x.iloc[-1])
+    df['min']  = roe_df.groupby('code')[field].apply(lambda x: min(x))
+    df['max']  = roe_df.groupby('code')[field].apply(lambda x: max(x))
+    df['mean'] = roe_df.groupby('code')[field].apply(lambda x: mean(x))
+    df['qdesc_1'] = roe_df.groupby('code')[field].apply(lambda x: x.iloc[-1] < x.iloc[-2])
+    df['qdesc_2'] = roe_df.groupby('code')[field].apply(lambda x: x.iloc[-1] < x.iloc[-2] and x.iloc[-2] < x.iloc[-3])
+    df = df[ (df['min'] > 0.15) & (df['new'] > df['mean'] ) & (df['qdesc_2'] == False)]
+    
+    return df.index.tolist()
+    
+def pe_ratio_median(context):
+    scandate = context.previous_date
+    q = query(valuation.code,valuation.pe_ratio)
+    df = get_fundamentals(q, scandate).dropna()
+    df['ep_ratio'] = 1/df['pe_ratio']
+    context.pe_ratio_median = 1/df['ep_ratio'].quantile(0.5)
+    
+def momentum_filter(stock):
+    price = attribute_history(stock, 21, '1d', ['close'], skip_paused=True, df=True, fq='pre')
+    condition = price['close'][-1]/price['close'][0] < 1.2
+    return condition
+
+def capital_allocation(context,buylist_tradable,method = 2):
+    df = pd.DataFrame()
+    scandate = context.previous_date
+    if method == 1:
+        q = query(valuation.code,valuation.pe_ratio).filter(
+            valuation.code.in_(buylist_tradable))
+        df =get_fundamentals(q, scanDate).dropna()
+        df['ep_ratio'] = 1/df['pe_ratio']
+        df['weight'] = df['ep_ratio']/df['ep_ratio'].sum()
+        return df
+    elif method == 2:
+        prices = history(250, '1d', 'close', security_list = buylist_tradable)
+        df['std'] = (prices.pct_change().std(axis = 0)*sqrt(250))
+        df['std2'] = 1/df['std']**3
+        df['weight'] = df['std2']/df['std2'].sum()
+        df.reset_index(inplace = True) 
+        df.columns = ['code','std','std2','weight']
+        return df
+
+def selection(context):
+    scandate = context.current_dt
+    stocklist = get_index_stocks('000906.XSHG')
+    roe_df = roe_ttm(stocklist,scandate,num = 12,period ='Q',tb = False)
+    roe_df = roe_df[roe_df['pubDate'] < scandate]
+    stocklist_1 = roe_filter(roe_df)
+    context.buylist = [stock for stock in stocklist_1 if momentum_filter(stock)]
+    context.weights0 = capital_allocation(context,context.buylist) #
+#    print '每月调仓信息'
+#    print  context.weights0
+        
+def rebalance(context):
+    current_data = get_current_data()
+    print context.buylist
+    buylist_tradable = [stock for stock in context.buylist if not (current_data[stock].paused or current_data[stock].day_open > current_data[stock].high_limit*0.985)]
+    if len(buylist_tradable) != 0:
+        weights = capital_allocation(context,buylist_tradable)
+    
+    for stock in context.portfolio.positions.keys():
+        if stock not in context.buylist:
+            order_target(stock,0)
+            
+    if  len(buylist_tradable) == 0:
+        pass
+    elif context.pe_ratio_median < 80:
+        t_value = 0.95*context.portfolio.total_value
+    elif context.pe_ratio_median > 80: 
+        t_value = 0.30*context.portfolio.total_value
+    for stock in buylist_tradable:
+        weight = weights[weights['code']== stock]['weight']
+        order_target_value(stock,weight*t_value)
+
+# 初始化函数
+def initialize(context):
+    set_benchmark('000906.XSHG')
+    set_option('use_real_price', True)
+    set_order_cost(OrderCost(close_tax=0.001, open_commission=0.0003, 
+    close_commission=0.0003, min_commission=5), type='stock')
+    
+    run_monthly(pe_ratio_median, 1,time='before_open')
+    run_monthly(selection, 1,time='open-3h')
+    run_monthly(rebalance, 1,time='open')    
+    
+def after_market_close(context):
+    Pass    
