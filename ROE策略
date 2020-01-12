@@ -41,7 +41,7 @@ def roe_ttm(stocklist,scandate,num = 10,period = 'Q',cut = True,tb = True):
         net_profit_ttm_df = pd.rolling_sum(df['net_profit'],4)
         adjusted_profit_ttm_df = pd.rolling_sum(df['adjust_profit'],4)
         equities_avg_df = pd.rolling_apply(df['equities'],4,lambda x: x[0]/2 + x[-1]/2)
-    # 四种
+    # 四种情况，摊薄或扣非
         if cut and tb:
             roe_df = adjusted_profit_ttm_df/df['equities']
         elif cut and (not tb):
@@ -85,29 +85,29 @@ def roe_ttm(stocklist,scandate,num = 10,period = 'Q',cut = True,tb = True):
 def roe_filter(roe_df):
     df = pd.DataFrame()
     field = roe_df.columns[-1]
-    df['new']  = roe_df.groupby('code')[field].apply(lambda x: x.iloc[-1])
+    df['new']  = roe_df.groupby('code')[field].apply(lambda x: x.iloc[-1]) # 按股票代码进行分组
     df['min']  = roe_df.groupby('code')[field].apply(lambda x: min(x))
     df['max']  = roe_df.groupby('code')[field].apply(lambda x: max(x))
     df['mean'] = roe_df.groupby('code')[field].apply(lambda x: mean(x))
     df['qdesc_1'] = roe_df.groupby('code')[field].apply(lambda x: x.iloc[-1] < x.iloc[-2])
     df['qdesc_2'] = roe_df.groupby('code')[field].apply(lambda x: x.iloc[-1] < x.iloc[-2] and x.iloc[-2] < x.iloc[-3])
     df = df[ (df['min'] > 0.15) & (df['new'] > df['mean'] ) & (df['qdesc_2'] == False)]
-    
+    # 最近一年的滚动 roe 大于 15,最新 roe 大于均值，roe未连续两季度下降
     return df.index.tolist()
     
-def pe_ratio_median(context):
+def pe_ratio_median(context): # #pe中位数控制仓位
     scandate = context.previous_date
     q = query(valuation.code,valuation.pe_ratio)
     df = get_fundamentals(q, scandate).dropna()
     df['ep_ratio'] = 1/df['pe_ratio']
     context.pe_ratio_median = 1/df['ep_ratio'].quantile(0.5)
     
-def momentum_filter(stock):
+def momentum_filter(stock):  #过滤月涨幅超过20%的股票,避免追高
     price = attribute_history(stock, 21, '1d', ['close'], skip_paused=True, df=True, fq='pre')
     condition = price['close'][-1]/price['close'][0] < 1.2
     return condition
 
-def capital_allocation(context,buylist_tradable,method = 2):
+def capital_allocation(context,buylist_tradable,method = 2): # PE加权或波动率加权
     df = pd.DataFrame()
     scandate = context.previous_date
     if method == 1:
@@ -140,9 +140,10 @@ def selection(context):
 def rebalance(context):
     current_data = get_current_data()
     print context.buylist
-    buylist_tradable = [stock for stock in context.buylist if not (current_data[stock].paused or current_data[stock].day_open > current_data[stock].high_limit*0.985)]
+    buylist_tradable = [stock for stock in context.buylist if not (current_data[stock].paused or current_data[stock].day_open 
+                        > current_data[stock].high_limit*0.985)] # 筛选出没有停牌和开盘价没有大于涨停价的 0.985 的股票（防止买入高开的股票）
     if len(buylist_tradable) != 0:
-        weights = capital_allocation(context,buylist_tradable)
+        weights = capital_allocation(context,buylist_tradable) # 默认执行method2，即根据强化的波动率来计算股票权重
     
     for stock in context.portfolio.positions.keys():
         if stock not in context.buylist:
